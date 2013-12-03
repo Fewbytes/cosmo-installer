@@ -34,9 +34,12 @@
           "externally_provisioned": true,
           "name": "cosmo-router"
         },
-        "security_group_ext": {
-          "name": "cosmo-sg-ext",
-          "from": "62.90.11.161/32"
+        "security_group_user": {
+          "name": "cosmo-sg-user"
+        },
+        "security_group_manager": {
+          "name": "cosmo-sg-manager",
+          "cidr": "62.90.11.161/32"
         }
     },
     "env": {

@@ -10,11 +10,14 @@ import sys
 
 # OpenStack
 import keystoneclient.v2_0.client as keystone_client
+import novaclient.v1_1.client as nova_client
+import novaclient.exceptions
 import neutronclient.neutron.client as neutron_client
 
 EP_FLAG = 'externally_provisioned'
 
-EXTERNAL_PORTS = (9000,)
+EXTERNAL_PORTS = (22, 9000)
+INTERNAL_PORTS = (5555, 5672) # Riemann, RabbitMQ
 
 
 class OpenStackLogicError(RuntimeError):
@@ -36,7 +39,7 @@ class CreateOrEnsureExists(object):
 
     def check_and_create(self, name, *args, **kw):
         self.create_or_ensure_logger.info("Will create {0} '{1}'".format(self.__class__.WHAT, name))
-        if self.find_by_name(name):
+        if self.list_objects_with_name(name):
             raise OpenStackLogicError("{0} '{1}' already exists".format(self.__class__.WHAT, name))
         return self.create(name, *args, **kw)
 
@@ -57,6 +60,12 @@ class CreateOrEnsureExists(object):
         raise OpenStackLogicError("Lookup of {0} named '{1}' failed. There are {2} matches."
                                   .format(self.__class__.WHAT, name, len(matches)))
 
+
+class CreateOrEnsureExistsNova(CreateOrEnsureExists):
+
+    def __init__(self, logger, connector):
+        CreateOrEnsureExists.__init__(self, logger)
+        self.nova_client = connector.get_nova_client()
 
 class CreateOrEnsureExistsNeutron(CreateOrEnsureExists):
 
@@ -125,20 +134,26 @@ class OpenStackRouterCreator(CreateOrEnsureExistsNeutron):
         return router_id
 
 
-class OpenStackSecurityGroupCreator(CreateOrEnsureExistsNeutron):
+class OpenStackSecurityGroupCreator(CreateOrEnsureExistsNova):
 
     WHAT = 'security group'
 
     def list_objects_with_name(self, name):
-        return self.neutron_client.list_security_groups(name=name)['security_groups']
+        sgs = self.nova_client.security_groups.list()
+        return [{'id': sg.id} for sg in sgs if sg.name == name]
 
-    def create(self, name, ext=False):
-        ret = self.neutron_client.create_security_group({
-            'security_group': {
-                'name': name
-            }
-        })
-        return ret['security_group']['id']
+    def create(self, name, description, rules):
+        sg = self.nova_client.security_groups.create(name, description)
+        for rule in rules:
+            self.nova_client.security_group_rules.create(
+                sg.id,
+                ip_protocol="tcp",
+                from_port=rule['port'],
+                to_port=rule['port'],
+                cidr=rule.get('cidr'),
+                group_id=rule.get('group_id')
+            )
+        return sg.id
 
 
 class OpenStackConnector(object):
@@ -151,11 +166,23 @@ class OpenStackConnector(object):
         self.neutron_client = neutron_client.Client('2.0', endpoint_url=config['neutron']['url'], token=self.keystone_client.auth_token)
         self.neutron_client.format = 'json'
 
+        kconf = self.config['keystone']
+        self.nova_client = nova_client.Client(
+            kconf['username'],
+            kconf['password'],
+            kconf['username'],
+            kconf['auth_url'],
+            region_name=self.config['management']['region']
+        )
+
     def get_keystone_client(self):
         return self.keystone_client
 
     def get_neutron_client(self):
         return self.neutron_client
+
+    def get_nova_client(self):
+        return self.nova_client
 
 
 class CosmoOnOpenStackInstaller(object):
@@ -184,8 +211,15 @@ class CosmoOnOpenStackInstaller(object):
             {'subnet_id': subnet_id},
         ], external_gateway_info={"network_id": enet_id})
 
-        sgconf = self.config['management']['security_group_ext']
-        sg_id = self.sg_creator.create_or_ensure_exists(sgconf, sgconf['name'])
+        # Security group for Cosmo created instances
+        sguconf = self.config['management']['security_group_user']
+        sgu_id = self.sg_creator.create_or_ensure_exists(sguconf, sguconf['name'], 'Cosmo created machines', [])
+
+        # Security group for Cosmo manager, allows created instances -> manager communication
+        sgmconf = self.config['management']['security_group_manager']
+        sg_rules = [{'port': p, 'group_id': sgu_id} for p in INTERNAL_PORTS] + \
+                   [{'port': p, 'cidr': sgmconf['cidr']} for p in EXTERNAL_PORTS]
+        sgm_id = self.sg_creator.create_or_ensure_exists(sgmconf, sgmconf['name'], 'Cosmo Manager', sg_rules)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Installs Cosmo in an OpenStack environment')
